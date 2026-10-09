@@ -1,0 +1,122 @@
+# =====================================================================================================
+# Reusable workflow — Checkmarx One (SAST + SCA) para cualquier repositorio de la organizacion
+# =====================================================================================================
+# Un solo job (no matriz por ecosistema): cx sube UN zip con UN .cxsca-results.json; separar por lenguaje
+# obligaria a N scans/proyectos o a fusionar resultados (no soportado). La paralelizacion real ocurre
+# en Checkmarx One (SAST y SCA corren en paralelo en el servidor).
+#
+# Configuracion central (Settings > Secrets and variables > Actions, a nivel ORGANIZACION):
+#   vars:    CX_BASE_URI, CX_TENANT, ARTIFACTORY_URL, CX_NPM_REPO, CX_MAVEN_REPO, CX_GRADLE_PLUGINS_REPO,
+#            CX_PYPI_REPO, CX_NUGET_REPO, CX_GO_REPO, CX_LEGACY_HOSTS, CX_GRADLE_DIST_BASE_URL,
+#            CX_CLI_URL, CX_SCA_RESOLVER_URL, CX_RUNS_ON
+#   secrets: CX_CLIENT_ID + CX_CLIENT_SECRET (o CX_APIKEY), ARTIFACTORY_USER, ARTIFACTORY_PASSWORD
+#            (opcional ARTIFACTORY_TOKEN)
+# =====================================================================================================
+name: checkmarx-one
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:            { type: string, required: false, default: "", description: 'JSON: "ubuntu-latest" o ["self-hosted","linux","x64"] (default: vars.CX_RUNS_ON)' }
+      project-name:       { type: string, required: false, default: "" }
+      source-dir:         { type: string, required: false, default: "." }
+      scan-types:         { type: string, required: false, default: "sast,sca" }
+      resolution-mode:    { type: string, required: false, default: "prebuilt" }
+      result-cache-ttl:   { type: string, required: false, default: "weekly" }
+      python-package-manager: { type: string, required: false, default: "pip" }
+      ignore-dev-dependencies: { type: boolean, required: false, default: false }
+      resolver-extra-params:   { type: string, required: false, default: "" }
+      resolver-excludes:  { type: string, required: false, default: "" }
+      exclude-dirs:       { type: string, required: false, default: "" }
+      strict:             { type: boolean, required: false, default: false }
+      file-filter-extra:  { type: string, required: false, default: "" }
+      sast-preset:        { type: string, required: false, default: "" }
+      project-tags:       { type: string, required: false, default: "" }
+      project-groups:     { type: string, required: false, default: "" }
+      application-name:   { type: string, required: false, default: "" }
+      upload-sarif:       { type: boolean, required: false, default: false }
+      debug:              { type: boolean, required: false, default: false }
+      timeout-minutes:    { type: number, required: false, default: 90 }
+    secrets:
+      CX_CLIENT_ID:         { required: false }
+      CX_CLIENT_SECRET:     { required: false }
+      CX_APIKEY:            { required: false }
+      ARTIFACTORY_USER:     { required: false }
+      ARTIFACTORY_PASSWORD: { required: false }
+      ARTIFACTORY_TOKEN:    { required: false }
+    outputs:
+      scan-id:    { value: "${{ jobs.checkmarx.outputs.scan-id }}" }
+      sca-source: { value: "${{ jobs.checkmarx.outputs.sca-source }}" }
+
+permissions:
+  contents: read
+
+jobs:
+  checkmarx:
+    name: Checkmarx One (SAST + SCA)
+    runs-on: ${{ fromJSON(inputs.runs-on != '' && inputs.runs-on || vars.CX_RUNS_ON || '"ubuntu-latest"') }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+      actions: read            # upload-sarif en repos privados
+      security-events: write   # solo se usa con upload-sarif: true
+    concurrency:
+      group: cx-one-${{ github.repository }}-${{ github.head_ref || github.ref }}-${{ inputs.source-dir }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    outputs:
+      scan-id: ${{ steps.cx.outputs.scan-id }}
+      sca-source: ${{ steps.cx.outputs.sca-source }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1            # analisis estatico: no hace falta historial
+          persist-credentials: false
+          lfs: false
+
+      - id: cx
+        # Reemplazar TU-ORG por la organizacion donde vive este repositorio central
+        uses: TU-ORG/cx-one-security/actions/checkmarx-one@v1
+        with:
+          project-name: ${{ inputs.project-name }}
+          source-dir: ${{ inputs.source-dir }}
+          scan-types: ${{ inputs.scan-types }}
+          cx-base-uri: ${{ vars.CX_BASE_URI }}
+          cx-base-auth-uri: ${{ vars.CX_BASE_AUTH_URI }}
+          cx-tenant: ${{ vars.CX_TENANT }}
+          cx-client-id: ${{ secrets.CX_CLIENT_ID }}
+          cx-client-secret: ${{ secrets.CX_CLIENT_SECRET }}
+          cx-apikey: ${{ secrets.CX_APIKEY }}
+          cx-cli-version: ${{ vars.CX_CLI_VERSION || '2.3.66' }}
+          cx-cli-url: ${{ vars.CX_CLI_URL || 'https://github.com/Checkmarx/ast-cli/releases/download/{version}/ast-cli_{version}_linux_{arch}.tar.gz' }}
+          sca-resolver-version: ${{ vars.CX_SCA_RESOLVER_VERSION || 'latest' }}
+          sca-resolver-url: ${{ vars.CX_SCA_RESOLVER_URL || 'https://sca-downloads.s3.amazonaws.com/cli/{version}/ScaResolver-linux64.tar.gz' }}
+          artifactory-url: ${{ vars.ARTIFACTORY_URL }}
+          artifactory-user: ${{ secrets.ARTIFACTORY_USER }}
+          artifactory-password: ${{ secrets.ARTIFACTORY_PASSWORD }}
+          artifactory-token: ${{ secrets.ARTIFACTORY_TOKEN }}
+          npm-repo: ${{ vars.CX_NPM_REPO }}
+          maven-repo: ${{ vars.CX_MAVEN_REPO }}
+          gradle-plugins-repo: ${{ vars.CX_GRADLE_PLUGINS_REPO }}
+          pypi-repo: ${{ vars.CX_PYPI_REPO }}
+          nuget-repo: ${{ vars.CX_NUGET_REPO }}
+          go-repo: ${{ vars.CX_GO_REPO }}
+          legacy-hosts: ${{ vars.CX_LEGACY_HOSTS }}
+          ca-bundle: ${{ vars.CX_CA_BUNDLE }}
+          gradle-distribution-base-url: ${{ vars.CX_GRADLE_DIST_BASE_URL }}
+          maven-dist-url: ${{ vars.CX_MAVEN_DIST_URL || 'https://archive.apache.org/dist/maven/maven-3/{version}/binaries/apache-maven-{version}-bin.tar.gz' }}
+          gradle-dist-url: ${{ vars.CX_GRADLE_DIST_URL || 'https://services.gradle.org/distributions/gradle-{version}-bin.zip' }}
+          resolution-mode: ${{ inputs.resolution-mode }}
+          result-cache-ttl: ${{ inputs.result-cache-ttl }}
+          python-package-manager: ${{ inputs.python-package-manager }}
+          ignore-dev-dependencies: ${{ inputs.ignore-dev-dependencies }}
+          resolver-extra-params: ${{ inputs.resolver-extra-params }}
+          resolver-excludes: ${{ inputs.resolver-excludes }}
+          exclude-dirs: ${{ inputs.exclude-dirs }}
+          strict: ${{ inputs.strict }}
+          file-filter-extra: ${{ inputs.file-filter-extra }}
+          sast-preset: ${{ inputs.sast-preset }}
+          project-tags: ${{ inputs.project-tags }}
+          project-groups: ${{ inputs.project-groups }}
+          application-name: ${{ inputs.application-name }}
+          upload-sarif: ${{ inputs.upload-sarif }}
+          debug: ${{ inputs.debug }}

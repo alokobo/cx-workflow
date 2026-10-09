@@ -1,0 +1,309 @@
+name: Checkmarx One (SAST + SCA) · resolucion optimizada
+description: >
+  Escaneo Checkmarx One con cx CLI y SCA Resolver para repos multilenguaje con dependencias publicas y
+  privadas (Artifactory on-premise). Sin compilacion ni instalaciones: deteccion unica, configuracion de
+  gestores sin secretos en disco, una sola resolucion cacheada por fingerprint de manifiestos.
+author: AppSec / DevSecOps
+
+inputs:
+  # ---------------------------------------------------------------- Checkmarx One
+  project-name:            { description: "Proyecto en Checkmarx One (default: owner/repo)", required: false, default: "" }
+  branch:                  { description: "Rama (default: head_ref o ref_name)", required: false, default: "" }
+  source-dir:              { description: "Raiz a escanear", required: false, default: "." }
+  scan-types:              { description: "sast,sca[,iac-security,...]. SCA se omite solo si no hay manifiestos", required: false, default: "sast,sca" }
+  cx-base-uri:             { description: "URL de Checkmarx One (p.ej. https://us.ast.checkmarx.net)", required: true }
+  cx-base-auth-uri:        { description: "IAM URL si es distinta a base-uri", required: false, default: "" }
+  cx-tenant:               { description: "Tenant", required: true }
+  cx-client-id:            { description: "OAuth client id", required: false, default: "" }
+  cx-client-secret:        { description: "OAuth client secret", required: false, default: "" }
+  cx-apikey:               { description: "API key (alternativa a client id/secret)", required: false, default: "" }
+  cx-cli-version:          { description: "Version del cx CLI (fijada = cache estable) o 'system' si viene en la imagen del runner", required: false, default: "2.3.66" }
+  cx-cli-url:              { description: "URL de descarga ({version},{arch}); en on-prem: generic remote de Artifactory", required: false, default: "https://github.com/Checkmarx/ast-cli/releases/download/{version}/ast-cli_{version}_linux_{arch}.tar.gz" }
+  sca-resolver-version:    { description: "Version de ScaResolver ('latest' rota la cache semanalmente; 'system' = preinstalado)", required: false, default: "latest" }
+  sca-resolver-url:        { description: "URL de descarga ({version})", required: false, default: "https://sca-downloads.s3.amazonaws.com/cli/{version}/ScaResolver-linux64.tar.gz" }
+  # ---------------------------------------------------------------- Artifactory
+  artifactory-url:         { description: "Base con contexto, p.ej. https://artifactory.empresa.com/artifactory", required: false, default: "" }
+  artifactory-user:        { description: "Usuario de Artifactory", required: false, default: "" }
+  artifactory-password:    { description: "Password / API key / identity token", required: false, default: "" }
+  artifactory-token:       { description: "Access token (bearer) opcional para npm/yarn/corepack y descargas", required: false, default: "" }
+  npm-repo:                { description: "Repo VIRTUAL npm (publico + privado)", required: false, default: "" }
+  maven-repo:              { description: "Repo VIRTUAL Maven (Central + Google + privados); tambien Gradle", required: false, default: "" }
+  gradle-plugins-repo:     { description: "Repo remote de plugins.gradle.org/m2 (default: maven-repo)", required: false, default: "" }
+  pypi-repo:               { description: "Repo VIRTUAL PyPI", required: false, default: "" }
+  nuget-repo:              { description: "Repo VIRTUAL NuGet v3", required: false, default: "" }
+  go-repo:                 { description: "Repo VIRTUAL Go", required: false, default: "" }
+  composer-repo:           { description: "Repo Composer", required: false, default: "" }
+  gems-repo:               { description: "Repo RubyGems", required: false, default: "" }
+  legacy-hosts:            { description: "csv host_viejo=host_nuevo (reescritura temporal en manifiestos e init.gradle)", required: false, default: "" }
+  ca-bundle:               { description: "Ruta a CA corporativa PEM en el runner", required: false, default: "" }
+  java-truststore:         { description: "Truststore JKS para Maven/Gradle", required: false, default: "" }
+  gradle-distribution-base-url: { description: "Base para distributionUrl del wrapper (generic remote de services.gradle.org)", required: false, default: "" }
+  maven-dist-url:          { description: "URL ({version}) de Maven si el runner no lo tiene", required: false, default: "https://archive.apache.org/dist/maven/maven-3/{version}/binaries/apache-maven-{version}-bin.tar.gz" }
+  gradle-dist-url:         { description: "URL ({version}) de Gradle si el repo no tiene gradlew", required: false, default: "https://services.gradle.org/distributions/gradle-{version}-bin.zip" }
+  # ---------------------------------------------------------------- resolucion
+  resolution-mode:         { description: "prebuilt (recomendado) | cli | server", required: false, default: "prebuilt" }
+  result-cache:            { description: "Reutilizar el resultado de ScaResolver si los manifiestos no cambiaron", required: false, default: "true" }
+  result-cache-ttl:        { description: "daily | weekly | monthly | none", required: false, default: "weekly" }
+  dependency-cache:        { description: "Cache de ~/.m2, Gradle, pip, npm, NuGet, Go entre ejecuciones", required: false, default: "true" }
+  install-toolchains:      { description: "Instalar con setup-* los toolchains que falten en el runner", required: false, default: "true" }
+  java-version:            { description: "JDK si falta en el runner", required: false, default: "17" }
+  node-version:            { description: "Node si falta (se prefiere .nvmrc/.node-version)", required: false, default: "20" }
+  python-version:          { description: "Python si falta (se prefiere .python-version)", required: false, default: "3.12" }
+  dotnet-version:          { description: ".NET SDK si falta (se prefiere global.json)", required: false, default: "8.0.x" }
+  python-package-manager:  { description: "pip | uv (uv resuelve bastante mas rapido)", required: false, default: "pip" }
+  ignore-dev-dependencies: { description: "Excluir dependencias dev/test", required: false, default: "false" }
+  resolver-excludes:       { description: "Patrones -e/--excludes de ScaResolver", required: false, default: "" }
+  resolver-extra-params:   { description: "Parametros extra de ScaResolver (p.ej. --gradle-exclude-scopes x)", required: false, default: "" }
+  resolver-timeout:        { description: "--resolver-timeout en minutos (0 = sin limite)", required: false, default: "30" }
+  exclude-dirs:            { description: "csv de carpetas a ignorar en la deteccion", required: false, default: "" }
+  strict:                  { description: "true: falla si algun manifiesto no resuelve", required: false, default: "false" }
+  react-native-support:    { description: "Instalar node_modules SOLO cuando settings.gradle lo exige (RN/Expo)", required: false, default: "true" }
+  override-repo-config:    { description: "Reemplazar .cxsca.configurations propio del repo", required: false, default: "false" }
+  # ---------------------------------------------------------------- scan / reportes / politica
+  file-filter:             { description: "Reemplaza el filtro por defecto del zip SAST", required: false, default: "" }
+  file-filter-extra:       { description: "Se agrega al filtro por defecto (p.ej. !test,!*.spec.ts)", required: false, default: "" }
+  sast-incremental:        { description: "auto (en PR) | true | false", required: false, default: "auto" }
+  sast-preset:             { description: "Preset SAST", required: false, default: "" }
+  project-tags:            { description: "Tags del proyecto", required: false, default: "" }
+  scan-tags:               { description: "Tags del scan (key:value)", required: false, default: "" }
+  project-groups:          { description: "Grupos del proyecto", required: false, default: "" }
+  application-name:        { description: "Aplicacion en Checkmarx One", required: false, default: "" }
+  scan-timeout:            { description: "Minutos maximos del scan (0 = sin limite)", required: false, default: "" }
+  extra-scan-args:         { description: "Argumentos extra de cx scan create", required: false, default: "" }
+  report-formats:          { description: "Formatos de reporte", required: false, default: "json,sarif,markdown,summaryHTML" }
+  debug:                   { description: "--debug en cx", required: false, default: "false" }
+  upload-reports:          { description: "Subir reportes y logs de ScaResolver como artifact", required: false, default: "true" }
+  upload-sarif:            { description: "Publicar SARIF en GitHub Code Scanning (requiere GHAS + security-events: write)", required: false, default: "false" }
+
+outputs:
+  scan-id:        { description: "ID del scan", value: "${{ steps.scan.outputs.scan_id }}" }
+  ecosystems:     { description: "Ecosistemas detectados", value: "${{ steps.detect.outputs.ecosystems }}" }
+  sca-source:     { description: "cache | resolved | server | none", value: "${{ steps.plan.outputs.sca_source }}" }
+  report-dir:     { description: "Directorio de reportes", value: "${{ steps.scan.outputs.report_dir }}" }
+
+runs:
+  using: composite
+  steps:
+    # ================================================================ 1. deteccion unica + fingerprint
+    - id: detect
+      shell: bash
+      env:
+        SOURCE_DIR: ${{ inputs.source-dir }}
+        CX_EXCLUDE_DIRS: ${{ inputs.exclude-dirs }}
+        CX_RESULT_TTL: ${{ inputs.result-cache-ttl }}
+        CX_FP_EXTRA: "v1|${{ inputs.project-name || github.repository }}|${{ inputs.sca-resolver-version }}|${{ inputs.python-package-manager }}|${{ inputs.ignore-dev-dependencies }}|${{ inputs.resolver-excludes }}|${{ inputs.resolver-extra-params }}|${{ inputs.artifactory-url }}|${{ inputs.npm-repo }}|${{ inputs.maven-repo }}|${{ inputs.gradle-plugins-repo }}|${{ inputs.pypi-repo }}|${{ inputs.nuget-repo }}|${{ inputs.go-repo }}|${{ inputs.legacy-hosts }}"
+      run: bash "${{ github.action_path }}/scripts/detect.sh"
+
+    # ================================================================ 2. ¿hay resultado SCA reutilizable?
+    - id: result-cache
+      if: steps.detect.outputs.sca_present == 'true' && contains(format(',{0},', inputs.scan-types), ',sca,') && inputs.resolution-mode == 'prebuilt' && inputs.result-cache == 'true'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/cx-one/result
+        key: cxsca-result-v1-${{ runner.os }}-${{ steps.detect.outputs.fingerprint }}
+
+    - id: plan
+      shell: bash
+      env:
+        SCA: ${{ steps.detect.outputs.sca_present }}
+        MODE: ${{ inputs.resolution-mode }}
+        HIT: ${{ steps.result-cache.outputs.cache-hit }}
+        RVER: ${{ inputs.sca-resolver-version }}
+        SCAN_TYPES: ${{ inputs.scan-types }}
+        SRC_DIR: ${{ inputs.source-dir }}
+      run: |
+        resolve=false; source=none
+        [[ ",${SCAN_TYPES}," == *,sca,* ]] || SCA=false      # scan-types sin sca: nada que resolver
+        if [[ "${SCA}" == true ]]; then
+          case "${MODE}" in
+            prebuilt) if [[ "${HIT}" == true ]]; then source=cache; else resolve=true; source=resolved; fi ;;
+            cli)      resolve=true; source=cli ;;
+            server)   source=server ;;
+          esac
+        fi
+        # 'latest' no identifica binario: se rota la cache de herramientas semanalmente
+        bucket=pinned; [[ "${RVER}" == latest ]] && bucket="$(date -u +%G-W%V)"
+        # sufijo unico por source-dir (varios llamados en el mismo run: artifacts / SARIF no colisionan)
+        inst="$(printf '%s' "${SRC_DIR}" | sed -E 's#^\./?##; s#[^A-Za-z0-9._-]+#-#g; s#^-+|-+$##g')"; inst="${inst:-root}"
+        { echo "resolve=${resolve}"; echo "sca_source=${source}"; echo "tools_bucket=${bucket}"; echo "instance=${inst}"; } >> "${GITHUB_OUTPUT}"
+        echo "[cx-one][plan] SCA=${SCA} modo=${MODE} resultado=${source} resolver_localmente=${resolve}"
+
+    # ================================================================ 3. toolchains SOLO si faltan (y solo si hay que resolver)
+    - if: steps.plan.outputs.resolve == 'true' && inputs.install-toolchains == 'true' && steps.detect.outputs.need_java == 'true' && steps.detect.outputs.have_java != 'true'
+      uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+      with: { distribution: temurin, java-version: "${{ inputs.java-version }}", cache: "" }
+    - if: steps.plan.outputs.resolve == 'true' && inputs.install-toolchains == 'true' && steps.detect.outputs.need_node == 'true' && steps.detect.outputs.have_node != 'true'
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: ${{ steps.detect.outputs.node_version_file == '' && inputs.node-version || '' }}
+        node-version-file: ${{ steps.detect.outputs.node_version_file }}
+        package-manager-cache: false
+    - if: steps.plan.outputs.resolve == 'true' && inputs.install-toolchains == 'true' && steps.detect.outputs.need_python == 'true' && steps.detect.outputs.have_python != 'true'
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: ${{ steps.detect.outputs.python_version_file == '' && inputs.python-version || '' }}
+        python-version-file: ${{ steps.detect.outputs.python_version_file }}
+    - if: steps.plan.outputs.resolve == 'true' && inputs.install-toolchains == 'true' && steps.detect.outputs.need_dotnet == 'true' && steps.detect.outputs.have_dotnet != 'true'
+      uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+      with:
+        dotnet-version: ${{ steps.detect.outputs.dotnet_global_json == '' && inputs.dotnet-version || '' }}
+        global-json-file: ${{ steps.detect.outputs.dotnet_global_json }}
+    - if: steps.plan.outputs.resolve == 'true' && inputs.install-toolchains == 'true' && steps.detect.outputs.need_go == 'true' && steps.detect.outputs.have_go != 'true'
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with: { go-version-file: "${{ steps.detect.outputs.go_mod_file }}", cache: false }
+
+    # ================================================================ 3b. cache de dependencias ANTES de configure (si no, el restore pisaria init.gradle/gradle.properties recien generados)
+    - if: steps.plan.outputs.resolve == 'true' && inputs.dependency-cache == 'true'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ~/.m2/repository
+          ~/.cache/cx-one
+          ~/.nuget/packages
+          !~/.cache/cx-one/gradle/caches/*/plugin-resolution
+        key: cxdeps-v1-${{ runner.os }}-${{ steps.detect.outputs.ecosystems }}-${{ steps.detect.outputs.fingerprint }}
+        restore-keys: |
+          cxdeps-v1-${{ runner.os }}-${{ steps.detect.outputs.ecosystems }}-
+
+    # ================================================================ 4. configuracion de gestores (sin instalar nada)
+    - id: configure
+      if: steps.plan.outputs.resolve == 'true'
+      shell: bash
+      env:
+        ARTIFACTORY_URL: ${{ inputs.artifactory-url }}
+        ARTIFACTORY_USER: ${{ inputs.artifactory-user }}
+        ARTIFACTORY_PASSWORD: ${{ inputs.artifactory-password }}
+        ARTIFACTORY_TOKEN: ${{ inputs.artifactory-token }}
+        CX_REPO_NPM: ${{ inputs.npm-repo }}
+        CX_REPO_MAVEN: ${{ inputs.maven-repo }}
+        CX_REPO_GRADLE_PLUGINS: ${{ inputs.gradle-plugins-repo }}
+        CX_REPO_PYPI: ${{ inputs.pypi-repo }}
+        CX_REPO_NUGET: ${{ inputs.nuget-repo }}
+        CX_REPO_GO: ${{ inputs.go-repo }}
+        CX_REPO_COMPOSER: ${{ inputs.composer-repo }}
+        CX_REPO_GEMS: ${{ inputs.gems-repo }}
+        CX_LEGACY_HOSTS: ${{ inputs.legacy-hosts }}
+        CX_CA_BUNDLE: ${{ inputs.ca-bundle }}
+        CX_JAVA_TRUSTSTORE: ${{ inputs.java-truststore }}
+        CX_GRADLE_DIST_BASE_URL: ${{ inputs.gradle-distribution-base-url }}
+        CX_OVERRIDE_REPO_CONFIG: ${{ inputs.override-repo-config }}
+      run: bash "${{ github.action_path }}/scripts/configure.sh"
+
+    # ================================================================ 5. herramientas (cacheadas por version)
+    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.tool_cache }}/cx-one-tools/cx
+        key: cxtools-cx-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cx-cli-version }}
+    - if: steps.plan.outputs.resolve == 'true'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ${{ runner.tool_cache }}/cx-one-tools/sca-resolver
+          ${{ runner.tool_cache }}/cx-one-tools/maven
+          ${{ runner.tool_cache }}/cx-one-tools/gradle
+        key: cxtools-resolver-v1-${{ runner.os }}-${{ inputs.sca-resolver-version }}-${{ steps.plan.outputs.tools_bucket }}
+    - shell: bash
+      env:
+        CX_CLI_VERSION: ${{ inputs.cx-cli-version }}
+        CX_CLI_URL: ${{ inputs.cx-cli-url }}
+        ARTIFACTORY_URL: ${{ inputs.artifactory-url }}
+        ARTIFACTORY_USER: ${{ inputs.artifactory-user }}
+        ARTIFACTORY_PASSWORD: ${{ inputs.artifactory-password }}
+        ARTIFACTORY_TOKEN: ${{ inputs.artifactory-token }}
+        CX_CA_BUNDLE: ${{ inputs.ca-bundle }}
+      run: bash "${{ github.action_path }}/scripts/install-tools.sh" cx
+    - if: steps.plan.outputs.resolve == 'true'
+      shell: bash
+      env:
+        CX_SCA_RESOLVER_VERSION: ${{ inputs.sca-resolver-version }}
+        CX_SCA_RESOLVER_URL: ${{ inputs.sca-resolver-url }}
+        CX_MAVEN_DIST_URL: ${{ inputs.maven-dist-url }}
+        CX_GRADLE_DIST_URL: ${{ inputs.gradle-dist-url }}
+        CX_PYTHON_PACKAGE_MANAGER: ${{ inputs.python-package-manager }}
+        ARTIFACTORY_URL: ${{ inputs.artifactory-url }}
+        ARTIFACTORY_USER: ${{ inputs.artifactory-user }}
+        ARTIFACTORY_PASSWORD: ${{ inputs.artifactory-password }}
+        ARTIFACTORY_TOKEN: ${{ inputs.artifactory-token }}
+        CX_CA_BUNDLE: ${{ inputs.ca-bundle }}
+      run: bash "${{ github.action_path }}/scripts/install-tools.sh" resolver
+
+    # ================================================================ 7. UNA resolucion para todos los ecosistemas
+    - id: resolve
+      if: steps.plan.outputs.resolve == 'true'
+      shell: bash
+      env:
+        CX_PROJECT_NAME: ${{ inputs.project-name || github.repository }}
+        CX_PYTHON_PACKAGE_MANAGER: ${{ inputs.python-package-manager }}
+        CX_IGNORE_DEV_DEPS: ${{ inputs.ignore-dev-dependencies }}
+        CX_RESOLVER_EXCLUDES: ${{ inputs.resolver-excludes }}
+        CX_RESOLVER_EXTRA_PARAMS: ${{ inputs.resolver-extra-params }}
+        CX_RESOLVER_TIMEOUT: ${{ inputs.resolver-timeout }}
+        CX_STRICT: ${{ inputs.strict }}
+        CX_REACT_NATIVE_SUPPORT: ${{ inputs.react-native-support }}
+        CX_LEGACY_HOSTS: ${{ inputs.legacy-hosts }}
+        CX_GRADLE_DIST_BASE_URL: ${{ inputs.gradle-distribution-base-url }}
+        ARTIFACTORY_USER: ${{ inputs.artifactory-user }}
+        ARTIFACTORY_PASSWORD: ${{ inputs.artifactory-password }}
+        ARTIFACTORY_TOKEN: ${{ inputs.artifactory-token }}
+      run: bash "${{ github.action_path }}/scripts/resolve.sh" ${{ inputs.resolution-mode == 'cli' && '--prepare-only' || '' }}
+
+    - if: steps.resolve.outputs.cacheable == 'true' && inputs.result-cache == 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/cx-one/result
+        key: cxsca-result-v1-${{ runner.os }}-${{ steps.detect.outputs.fingerprint }}
+
+    # ================================================================ 8. scan
+    - id: scan
+      shell: bash
+      env:
+        CX_BASE_URI: ${{ inputs.cx-base-uri }}
+        CX_BASE_AUTH_URI: ${{ inputs.cx-base-auth-uri }}
+        CX_TENANT: ${{ inputs.cx-tenant }}
+        CX_CLIENT_ID: ${{ inputs.cx-client-id }}
+        CX_CLIENT_SECRET: ${{ inputs.cx-client-secret }}
+        CX_APIKEY: ${{ inputs.cx-apikey }}
+        CX_PROJECT_NAME: ${{ inputs.project-name || github.repository }}
+        CX_BRANCH: ${{ inputs.branch }}
+        CX_SCAN_TYPES: ${{ inputs.scan-types }}
+        CX_RESOLUTION_MODE: ${{ steps.plan.outputs.sca_source == 'server' && 'server' || inputs.resolution-mode }}
+        CX_SCA_RESULT_ORIGIN: ${{ steps.plan.outputs.sca_source }}
+        CX_CA_BUNDLE: ${{ inputs.ca-bundle }}
+        CX_GRADLE_DIST_BASE_URL: ${{ inputs.gradle-distribution-base-url }}
+        CX_FILE_FILTER: ${{ inputs.file-filter }}
+        CX_FILE_FILTER_EXTRA: ${{ inputs.file-filter-extra }}
+        CX_SAST_INCREMENTAL: ${{ inputs.sast-incremental }}
+        CX_SAST_PRESET: ${{ inputs.sast-preset }}
+        CX_PROJECT_TAGS: ${{ inputs.project-tags }}
+        CX_SCAN_TAGS: ${{ inputs.scan-tags }}
+        CX_PROJECT_GROUPS: ${{ inputs.project-groups }}
+        CX_APPLICATION: ${{ inputs.application-name }}
+        CX_SCAN_TIMEOUT: ${{ inputs.scan-timeout }}
+        CX_EXTRA_SCAN_ARGS: ${{ inputs.extra-scan-args }}
+        CX_REPORT_FORMATS: ${{ inputs.report-formats }}
+        CX_DEBUG: ${{ inputs.debug }}
+        ARTIFACTORY_USER: ${{ inputs.resolution-mode == 'cli' && inputs.artifactory-user || '' }}
+        ARTIFACTORY_PASSWORD: ${{ inputs.resolution-mode == 'cli' && inputs.artifactory-password || '' }}
+        ARTIFACTORY_TOKEN: ${{ inputs.resolution-mode == 'cli' && inputs.artifactory-token || '' }}
+      run: bash "${{ github.action_path }}/scripts/scan.sh"
+
+    # ================================================================ 9. evidencias y limpieza
+    - if: always() && inputs.upload-reports == 'true'
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: cx-one-${{ github.job }}-${{ steps.plan.outputs.instance }}-${{ github.run_attempt }}
+        path: |
+          ${{ runner.temp }}/cx-one/reports
+          ${{ runner.temp }}/cx-one/sca-logs
+        if-no-files-found: ignore
+        retention-days: 14
+
+    - if: always() && inputs.upload-sarif == 'true' && steps.scan.outputs.report_dir != ''
+      uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+      with:
+        sarif_file: ${{ steps.scan.outputs.report_dir }}/cx_result.sarif
+        category: checkmarx-one-${{ steps.plan.outputs.instance }}
+
+    - if: always()
+      shell: bash
+      run: bash "${{ github.action_path }}/scripts/cleanup.sh"
